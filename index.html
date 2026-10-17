@@ -111,6 +111,7 @@
     padding: env(safe-area-inset-top) 0 calc(env(safe-area-inset-bottom) + 12px);
   }
   #camPrompt { flex: none; width: 100%; display: block; }
+  #camPrompt.focus { width: 62%; margin: 0 auto; border-radius: 0 0 14px 14px; }
   /* stage shows exactly what gets recorded: no cropping */
   .camStage { flex: 1; min-height: 0; position: relative; }
   .camFrame { position: absolute; overflow: hidden; outline: 1px solid rgba(255,255,255,.35); }
@@ -193,6 +194,13 @@
       <div class="seg" data-key="align">
         <button data-v="left">靠左</button>
         <button data-v="center">置中</button>
+      </div>
+    </div>
+    <div class="row">
+      <label>網頁錄影時的文字寬度</label>
+      <div class="seg" data-key="focus">
+        <button data-v="on">聚焦（眼神不飄）</button>
+        <button data-v="off">一般寬度</button>
       </div>
     </div>
     <div class="row">
@@ -303,6 +311,7 @@
     theme: store.get('theme', 'wb'),
     align: store.get('align', 'left'),
     lead: store.get('lead', '3'),
+    focus: store.get('focus', 'on'),
     rate: '1'
   };
 
@@ -338,13 +347,16 @@
 
   function charCount(text) { return (text.match(/\S/g) || []).length; }
 
-  function makeLayout(canvas) {
-    const [W, H] = RATIOS[S.ratio];
+  // focus: a narrow, centred column right under the lens, so the eyes barely move
+  function makeLayout(canvas, focus) {
+    const [W, H] = focus ? [560, 380] : RATIOS[S.ratio];
+    const padX = focus ? 18 : PAD_X;
+    const align = focus ? 'center' : S.align;
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext('2d');
     const font = `600 ${S.fs}px -apple-system, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif`;
     ctx.font = font;
-    const lines = wrap(ctx, S.script, W - PAD_X * 2);
+    const lines = wrap(ctx, S.script, W - padX * 2);
     const lh = Math.round(S.fs * 1.35);
     const chars = Math.max(1, charCount(S.script));
     const scrollDur = chars / S.cps;
@@ -354,7 +366,8 @@
     return {
       W, H, ctx, font, lines, lh, lead, tail, scrollDur,
       speed: scrollH / scrollDur,
-      guideY: Math.round(H * 0.3),
+      guideY: Math.round(H * (focus ? 0.36 : 0.3)),
+      padX, align, focus: !!focus,
       total: lead + scrollDur + tail
     };
   }
@@ -372,8 +385,8 @@
 
     ctx.font = L.font;
     ctx.textBaseline = 'middle';
-    ctx.textAlign = S.align === 'center' ? 'center' : 'left';
-    const x = S.align === 'center' ? W / 2 : PAD_X;
+    ctx.textAlign = L.align === 'center' ? 'center' : 'left';
+    const x = L.align === 'center' ? W / 2 : L.padX;
     const first = Math.max(0, Math.floor((offset - guideY) / lh) - 1);
     const last = Math.min(L.lines.length - 1, Math.ceil((offset + H - guideY) / lh) + 1);
     for (let i = first; i <= last; i++) {
@@ -747,7 +760,8 @@
     $('camDone').classList.add('hidden');
     $('camErr').classList.add('hidden');
     document.body.style.overflow = 'hidden';
-    cam.L = makeLayout($('camPrompt'));
+    cam.L = makeLayout($('camPrompt'), S.focus === 'on');
+    $('camPrompt').classList.toggle('focus', S.focus === 'on');
     cam.t = cam.L.lead; // show the text still, ready to go
     cam.scrolling = false; cam.lastTs = null; cam.rate = Number(S.rate) || 1;
     camRateUI();
