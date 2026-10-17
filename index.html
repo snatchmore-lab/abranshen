@@ -121,6 +121,11 @@
       linear-gradient(to right, transparent calc(33.33% - .5px), rgba(255,255,255,.3) 33.33%, transparent calc(33.33% + .5px), transparent calc(66.66% - .5px), rgba(255,255,255,.3) 66.66%, transparent calc(66.66% + .5px)),
       linear-gradient(to bottom, transparent calc(33.33% - .5px), rgba(255,255,255,.3) 33.33%, transparent calc(33.33% + .5px), transparent calc(66.66% - .5px), rgba(255,255,255,.3) 66.66%, transparent calc(66.66% + .5px));
   }
+  .camFitBtn {
+    position: absolute; right: 10px; top: 10px; z-index: 2;
+    padding: 7px 12px; border-radius: 999px; border: 0;
+    background: rgba(0,0,0,.6); color: #fff; font: inherit; font-size: 13px; cursor: pointer;
+  }
   .camInfo {
     flex: none; padding: 8px 12px 6px;
     text-align: center; color: #fff; font-size: 13px; line-height: 1.5;
@@ -137,7 +142,7 @@
   .camBar .rec.on { background: rgba(0,0,0,.45); }
   .camBar .rec.on::after { content: ""; width: 28px; height: 28px; border-radius: 6px; background: #ff3b30; }
   .camDone {
-    position: absolute; inset: 0; background: var(--bg); color: var(--text); overflow: auto;
+    position: absolute; inset: 0; z-index: 5; background: var(--bg); color: var(--text); overflow: auto;
     padding: calc(env(safe-area-inset-top) + 20px) 16px calc(env(safe-area-inset-bottom) + 30px);
   }
   .camDone video { width: 100%; max-height: 62vh; background: #000; border-radius: 12px; display: block; margin-bottom: 14px; }
@@ -251,6 +256,7 @@
       <video id="camVideo" playsinline muted autoplay></video>
       <div class="camGrid"></div>
     </div>
+    <button class="camFitBtn" id="camFitBtn"></button>
   </div>
   <div class="camErr hidden" id="camErr"></div>
   <div class="camInfo"><span id="camTime">按紅色鍵開始錄影</span> · 速度 <span id="camRate">1.0×</span><br><small>框線內就是錄到的完整畫面<span id="camRes"></span> · 點文字可暫停</small></div>
@@ -620,11 +626,19 @@
     const h = vw / ASPECT; return [0, (vh - h) / 2, vw, h];
   }
 
+  // 'fill' = crop to fill 9:16; 'full' = whole camera image, black bars if needed
+  let camFitMode = store.get('fit', 'full');
+
   function sizeRecCanvas() {
     const v = $('camVideo');
     if (!v.videoWidth) return;
-    const [, , cw] = cropRect(v.videoWidth, v.videoHeight);
-    const w = Math.min(1080, Math.round(cw / 2) * 2);
+    let w;
+    if (camFitMode === 'fill') {
+      w = Math.round(cropRect(v.videoWidth, v.videoHeight)[2] / 2) * 2;
+    } else {
+      w = Math.max(v.videoWidth, v.videoHeight) >= 1280 ? 1080 : 720;
+    }
+    w = Math.min(1080, w);
     recCanvas.width = w;
     recCanvas.height = Math.round(w / ASPECT / 2) * 2;
   }
@@ -632,8 +646,22 @@
   function drawRecFrame() {
     const v = $('camVideo');
     if (!v.videoWidth || v.readyState < 2) return;
-    const [sx, sy, sw, sh] = cropRect(v.videoWidth, v.videoHeight);
-    recCtx.drawImage(v, sx, sy, sw, sh, 0, 0, recCanvas.width, recCanvas.height);
+    const W = recCanvas.width, H = recCanvas.height;
+    if (camFitMode === 'fill') {
+      const [sx, sy, sw, sh] = cropRect(v.videoWidth, v.videoHeight);
+      recCtx.drawImage(v, sx, sy, sw, sh, 0, 0, W, H);
+    } else {
+      const k = Math.min(W / v.videoWidth, H / v.videoHeight);
+      const dw = v.videoWidth * k, dh = v.videoHeight * k;
+      recCtx.fillStyle = '#000';
+      recCtx.fillRect(0, 0, W, H);
+      recCtx.drawImage(v, (W - dw) / 2, (H - dh) / 2, dw, dh);
+    }
+  }
+
+  function camFitUI() {
+    $('camVideo').style.objectFit = camFitMode === 'fill' ? 'cover' : 'contain';
+    $('camFitBtn').textContent = camFitMode === 'fill' ? '顯示完整鏡頭畫面' : '填滿直式畫面';
   }
 
   function camLoop(ts) {
@@ -663,16 +691,7 @@
     sizeRecCanvas();
     $('camRes').textContent = recCanvas.width && v.videoWidth ? '（直式 ' + recCanvas.width + '×' + recCanvas.height + '，鏡頭 ' + v.videoWidth + '×' + v.videoHeight + '）' : '';
   }
-  $('camVideo').addEventListener('loadedmetadata', async () => {
-    const v = $('camVideo');
-    const track = cam.stream && cam.stream.getVideoTracks()[0];
-    // landscape source: ask for the tallest frame we can get, since we crop the middle 9:16
-    if (track && !cam.upgraded && v.videoWidth > v.videoHeight && v.videoHeight < 1080) {
-      cam.upgraded = true;
-      try { await track.applyConstraints({ width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } }); } catch (e) { console.warn(e); }
-    }
-    camFit();
-  });
+  $('camVideo').addEventListener('loadedmetadata', camFit);
   $('camVideo').addEventListener('resize', camFit);
   window.addEventListener('resize', () => { if (!$('cam').classList.contains('hidden')) camFit(); });
 
@@ -689,13 +708,20 @@
     $('camTime').textContent = '按紅色鍵開始錄影';
     cancelAnimationFrame(cam.raf);
     cam.raf = requestAnimationFrame(camLoop);
+    camFitUI();
     camFit();
     if (cam.stream) return;
     try {
+      // a square "ideal" makes iOS pick its largest 4:3 format = the widest field of view
       cam.stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: { ideal: 1080 }, height: { ideal: 1920 }, aspectRatio: { ideal: 9 / 16 }, frameRate: { ideal: 30 } },
+        video: { facingMode: 'user', width: { ideal: 1920 }, height: { ideal: 1920 }, frameRate: { ideal: 30 } },
         audio: { echoCancellation: true, noiseSuppression: true }
       });
+      const track = cam.stream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      if (caps.zoom && caps.zoom.min !== undefined) {
+        try { await track.applyConstraints({ advanced: [{ zoom: caps.zoom.min }] }); } catch (e) { console.warn(e); }
+      }
       $('camVideo').srcObject = cam.stream;
       await $('camVideo').play().catch(() => {});
     } catch (e) {
@@ -709,7 +735,6 @@
     if (cam.recorder && cam.recorder.state !== 'inactive') cam.recorder.stop();
     if (cam.stream) cam.stream.getTracks().forEach(t => t.stop());
     cam.stream = null;
-    cam.upgraded = false;
     $('camVideo').srcObject = null;
     cancelAnimationFrame(cam.raf);
     $('cam').classList.add('hidden');
@@ -759,6 +784,12 @@
   $('camClose').addEventListener('click', camStop);
   $('camExit').addEventListener('click', camStop);
   $('camRec').addEventListener('click', camToggleRec);
+  $('camFitBtn').addEventListener('click', () => {
+    if (cam.recorder && cam.recorder.state === 'recording') return;
+    camFitMode = camFitMode === 'fill' ? 'full' : 'fill';
+    store.set('fit', camFitMode);
+    camFitUI(); camFit();
+  });
   $('camPrompt').addEventListener('click', () => { cam.scrolling = !cam.scrolling; cam.lastTs = null; });
   $('camRestart').addEventListener('click', () => { cam.t = cam.L.lead; cam.lastTs = null; });
   $('camSlower').addEventListener('click', () => { cam.rate = Math.max(0.5, Math.round((cam.rate - 0.1) * 10) / 10); camRateUI(); });
