@@ -123,10 +123,21 @@
       linear-gradient(to bottom, transparent calc(33.33% - .5px), rgba(255,255,255,.3) 33.33%, transparent calc(33.33% + .5px), transparent calc(66.66% - .5px), rgba(255,255,255,.3) 66.66%, transparent calc(66.66% + .5px));
   }
   .camFitBtn {
-    position: absolute; right: 10px; top: 10px; z-index: 2;
+    position: absolute; right: 10px; top: 16px; z-index: 2;
     padding: 7px 12px; border-radius: 999px; border: 0;
     background: rgba(0,0,0,.6); color: #fff; font: inherit; font-size: 13px; cursor: pointer;
   }
+  .camPills { flex: none; display: flex; justify-content: center; gap: 10px; padding: 8px 8px 0; flex-wrap: wrap; }
+  .camPills .grp { display: flex; background: rgba(255,255,255,.12); border-radius: 999px; padding: 2px; }
+  .camPills button {
+    border: 0; background: transparent; color: rgba(255,255,255,.75);
+    font: inherit; font-size: 12.5px; padding: 5px 10px; border-radius: 999px; cursor: pointer;
+  }
+  .camPills button[aria-pressed="true"] { background: #fff; color: #000; font-weight: 600; }
+  .camPills.locked button:not([aria-pressed="true"]) { opacity: .35; }
+  .camProg { position: absolute; left: 10px; right: 10px; top: 4px; height: 5px; border-radius: 3px; background: rgba(255,255,255,.25); overflow: hidden; z-index: 3; }
+  .camProg i { position: absolute; left: 0; top: 0; bottom: 0; background: #ff3b30; }
+  .camProg b { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; }
   .camInfo {
     flex: none; padding: 8px 12px 6px;
     text-align: center; color: #fff; font-size: 13px; line-height: 1.5;
@@ -259,7 +270,12 @@
 
 <div class="cam hidden" id="cam">
   <canvas id="camPrompt"></canvas>
+  <div class="camPills" id="camPills">
+    <div class="grp" data-key="shoot"><button data-v="one">一鏡到底</button><button data-v="multi">多個片段</button></div>
+    <div class="grp" data-key="limit"><button data-v="15">15秒</button><button data-v="60">60秒</button><button data-v="180">3分鐘</button><button data-v="0">不限</button></div>
+  </div>
   <div class="camStage" id="camStage">
+    <div class="camProg hidden" id="camProg"><i id="camProgFill"></i><span id="camProgMarks"></span></div>
     <div class="camFrame" id="camFrame">
       <video id="camVideo" playsinline muted autoplay></video>
       <div class="camGrid"></div>
@@ -278,6 +294,7 @@
   </div>
   <div class="camDone hidden" id="camDone">
     <h2 class="step"><span class="num">✓</span>錄好了</h2>
+    <p class="status" id="camDoneMsg"></p>
     <video id="review" playsinline controls></video>
     <button class="big" id="camSave">儲存到相簿</button>
     <a class="ghost" id="camDl">下載影片</a>
@@ -312,6 +329,8 @@
     align: store.get('align', 'left'),
     lead: store.get('lead', '3'),
     focus: store.get('focus', 'on'),
+    shoot: store.get('shoot', 'one'),
+    limit: store.get('limit', '60'),
     rate: '1'
   };
 
@@ -626,7 +645,8 @@
   // ---------- In-page camera recording ----------
   const cam = {
     stream: null, recorder: null, chunks: [], blob: null, url: null,
-    L: null, raf: 0, t: 0, lastTs: null, scrolling: false, rate: 1, recStart: 0
+    L: null, raf: 0, t: 0, lastTs: null, scrolling: false, rate: 1, recStart: 0,
+    clips: [], parts: null, holdUntil: 0, stopping: false, stopAt: 0
   };
 
   // iOS Safari records the camera in sensor orientation (landscape), so we
@@ -697,16 +717,48 @@
     schedule();
   }
 
+  const mmss = sec => { const s = Math.floor(sec); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); };
+  const isRecording = () => !!(cam.recorder && cam.recorder.state === 'recording');
+  const recordedSec = () => cam.clips.reduce((a, c) => a + c.dur, 0) + (isRecording() ? (performance.now() - cam.recStart) / 1000 : 0);
+
   function camLoop(ts) {
-    if (cam.scrolling && cam.lastTs !== null) cam.t = Math.min(cam.L.total, cam.t + (ts - cam.lastTs) / 1000 * cam.rate);
+    if (cam.scrolling && cam.lastTs !== null && ts >= cam.holdUntil) cam.t = Math.min(cam.L.total, cam.t + (ts - cam.lastTs) / 1000 * cam.rate);
     cam.lastTs = ts;
     draw(cam.L, cam.t);
-    if (cam.recorder && cam.recorder.state === 'recording') {
-      const s = Math.floor((performance.now() - cam.recStart) / 1000);
-      $('camTime').innerHTML = '<span class="dot"></span>' + String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+    const limit = Number(S.limit);
+    const total = recordedSec();
+    if (isRecording()) {
+      const clipTag = S.shoot === 'multi' ? '片段 ' + (cam.clips.length + 1) + ' · ' : '';
+      $('camTime').innerHTML = '<span class="dot"></span>' + clipTag + mmss(total) + (limit ? ' / ' + mmss(limit) : '');
+      if (limit && total >= limit && !cam.stopping) camStopClip();
     }
+    if (limit) $('camProgFill').style.width = Math.min(100, total / limit * 100) + '%';
     cam.raf = requestAnimationFrame(camLoop);
   }
+
+  // pills, progress marks and the two side buttons depend on mode + clips
+  function camUI() {
+    const busy = isRecording() || cam.clips.length > 0;
+    $('camPills').classList.toggle('locked', busy);
+    $('camPills').querySelectorAll('.grp').forEach(g => g.querySelectorAll('button').forEach(b =>
+      b.setAttribute('aria-pressed', String(b.dataset.v === String(S[g.dataset.key])))));
+    const limit = Number(S.limit);
+    $('camProg').classList.toggle('hidden', !limit);
+    let acc = 0;
+    $('camProgMarks').innerHTML = limit ? cam.clips.map(c => { acc += c.dur; return '<b style="left:calc(' + Math.min(100, acc / limit * 100) + '% - 1px)"></b>'; }).join('') : '';
+    const multiHasClips = S.shoot === 'multi' && cam.clips.length > 0 && !isRecording();
+    $('camClose').textContent = multiHasClips ? '⌫' : '✕';
+    $('camClose').setAttribute('aria-label', multiHasClips ? '刪除上一段' : '關閉');
+    $('camRestart').textContent = multiHasClips ? '✓' : '↺';
+    $('camRestart').setAttribute('aria-label', multiHasClips ? '完成' : '文字回到開頭');
+    $('camRestart').style.background = multiHasClips ? '#ff3b30' : '';
+    if (!isRecording()) {
+      $('camTime').textContent = cam.clips.length
+        ? '已錄 ' + cam.clips.length + ' 段 · ' + mmss(recordedSec()) + (limit ? ' / ' + mmss(limit) : '') + '　按紅色鍵錄下一段'
+        : '按紅色鍵開始錄影';
+    }
+  }
+
 
   function camRateUI() { $('camRate').textContent = cam.rate.toFixed(1) + '×'; }
 
@@ -765,7 +817,8 @@
     cam.t = cam.L.lead; // show the text still, ready to go
     cam.scrolling = false; cam.lastTs = null; cam.rate = Number(S.rate) || 1;
     camRateUI();
-    $('camTime').textContent = '按紅色鍵開始錄影';
+    cam.clips = []; cam.parts = null;
+    camUI();
     cancelAnimationFrame(cam.raf);
     cam.raf = requestAnimationFrame(camLoop);
     camFitUI();
@@ -802,12 +855,10 @@
     document.body.style.overflow = '';
   }
 
-  function camToggleRec() {
-    if (!cam.stream) return;
-    if (cam.recorder && cam.recorder.state === 'recording') {
-      cam.recorder.stop();
-      return;
-    }
+  function camStartClip() {
+    if (!cam.stream || isRecording()) return;
+    const limit = Number(S.limit);
+    if (limit && recordedSec() >= limit - 0.2) return;
     const type = ['video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm'].find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
     let out = cam.stream;
     cam.canvasTrack = null;
@@ -824,38 +875,251 @@
       }
       cam.stream.getAudioTracks().forEach(t => out.addTrack(t));
     }
+    let rec;
     try {
-      cam.recorder = new MediaRecorder(out, Object.assign({ videoBitsPerSecond: 8_000_000 }, type ? { mimeType: type } : {}));
+      rec = new MediaRecorder(out, Object.assign({ videoBitsPerSecond: 8_000_000 }, type ? { mimeType: type } : {}));
     } catch (e) {
       $('camErr').textContent = '這個瀏覽器不支援網頁錄影，請用 iPhone 的 Safari。';
       $('camErr').classList.remove('hidden');
       return;
     }
-    cam.chunks = [];
-    cam.recorder.ondataavailable = e => { if (e.data && e.data.size) cam.chunks.push(e.data); };
-    cam.recorder.onstop = () => {
+    const chunks = [];
+    const first = cam.clips.length === 0;
+    // first clip (or one-take) starts from the top with the countdown;
+    // later clips pick up where the text stopped, after a short breath
+    const tStart = first ? cam.L.lead : cam.t;
+    if (first) cam.t = 0; else cam.holdUntil = performance.now() + 600;
+    rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    rec.onstop = () => {
+      const dur = (cam.stopAt - cam.recStart) / 1000;
+      cam.stopping = false;
       $('camRec').classList.remove('on');
       cam.scrolling = false;
-      cam.blob = new Blob(cam.chunks, { type: cam.recorder.mimeType || type || 'video/mp4' });
       if (cam.canvasTrack) { cam.canvasTrack.stop(); cam.canvasTrack = null; }
-      if (cam.url) URL.revokeObjectURL(cam.url);
-      cam.url = URL.createObjectURL(cam.blob);
-      const ext = cam.blob.type.includes('webm') ? 'webm' : 'mp4';
-      $('review').src = cam.url;
-      $('camDl').href = cam.url;
-      $('camDl').download = 'reels-' + new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '') + '.' + ext;
-      $('camDone').classList.remove('hidden');
+      if (!cam.stream) return; // camera was closed mid-take
+      cam.clips.push({ blob: new Blob(chunks, { type: rec.mimeType || type || 'video/mp4' }), dur, tStart });
+      const lim = Number(S.limit);
+      if (S.shoot === 'one' || (lim && recordedSec() >= lim - 0.2)) camFinish();
+      else camUI();
     };
-    cam.recorder.start(1000);
+    cam.recorder = rec;
+    rec.start(1000);
     cam.recStart = performance.now();
     pumpRecFrames();
     $('camRec').classList.add('on');
-    // restart the script with its countdown
-    cam.t = 0; cam.lastTs = null; cam.scrolling = true;
+    cam.lastTs = null; cam.scrolling = true;
+    camUI();
+  }
+
+  function camStopClip() {
+    if (!isRecording()) return;
+    cam.stopping = true;
+    cam.stopAt = performance.now();
+    cam.recorder.stop();
+  }
+
+  function camToggleRec() { isRecording() ? camStopClip() : camStartClip(); }
+
+  function camDeleteLast() {
+    const c = cam.clips.pop();
+    if (c) { cam.t = c.tStart; cam.lastTs = null; }
+    camUI();
+  }
+
+  async function camFinish() {
+    if (!cam.clips.length) return;
+    const clips = cam.clips.slice();
+    $('camDone').classList.remove('hidden');
+    $('camDoneMsg').textContent = clips.length > 1 ? '正在把 ' + clips.length + ' 段接成一支影片…' : '';
+    $('camSave').disabled = true;
+    cam.parts = null;
+    let blob = clips[0].blob;
+    if (clips.length > 1) {
+      blob = null;
+      try {
+        const r = await mergeClips(clips.map(c => c.blob));
+        if (await playable(r.blob, r.seconds)) blob = r.blob;
+      } catch (e) { console.warn('merge failed', e); }
+    }
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '');
+    if (blob) {
+      cam.blob = blob;
+      $('camDoneMsg').textContent = clips.length > 1 ? '已把 ' + clips.length + ' 段接成一支，共 ' + mmss(clips.reduce((a, c) => a + c.dur, 0)) + '。' : '';
+    } else {
+      // could not join: keep the clips and save them all at once
+      cam.blob = clips[0].blob;
+      cam.parts = clips.map((c, i) => new File([c.blob], 'reels-' + stamp + '-' + (i + 1) + (c.blob.type.includes('webm') ? '.webm' : '.mp4'), { type: c.blob.type }));
+      $('camDoneMsg').textContent = '這台手機錄的片段無法自動接起來，按「儲存到相簿」會把 ' + clips.length + ' 段一起存進相簿（下面只預覽第 1 段）。';
+    }
+    if (cam.url) URL.revokeObjectURL(cam.url);
+    cam.url = URL.createObjectURL(cam.blob);
+    $('review').src = cam.url;
+    $('camDl').href = cam.url;
+    $('camDl').download = 'reels-' + stamp + (cam.blob.type.includes('webm') ? '.webm' : '.mp4');
+    $('camDl').classList.toggle('hidden', !!cam.parts);
+    $('camSave').disabled = false;
+  }
+
+  function playable(blob, seconds) {
+    return new Promise(resolve => {
+      const v = document.createElement('video');
+      const url = URL.createObjectURL(blob);
+      const done = ok => { clearTimeout(timer); URL.revokeObjectURL(url); v.removeAttribute('src'); resolve(ok); };
+      const timer = setTimeout(() => done(false), 5000);
+      v.muted = true; v.preload = 'metadata';
+      v.onloadedmetadata = () => done(!isFinite(v.duration) || v.duration >= seconds * 0.8);
+      v.onerror = () => done(false);
+      v.src = url;
+    });
+  }
+
+  // ---------- Join clips: concatenate fragmented MP4s without re-encoding ----------
+  function mp4Boxes(u8, dv, start, end) {
+    const out = [];
+    let p = start;
+    while (p + 8 <= end) {
+      let size = dv.getUint32(p), hdr = 8;
+      const type = String.fromCharCode(u8[p + 4], u8[p + 5], u8[p + 6], u8[p + 7]);
+      if (size === 1) { size = Number(dv.getBigUint64(p + 8)); hdr = 16; } else if (size === 0) size = end - p;
+      if (size < hdr || p + size > end) throw new Error('bad box ' + type);
+      out.push({ type, start: p, end: p + size, body: p + hdr });
+      p += size;
+    }
+    return out;
+  }
+
+  function parseMp4(buf) {
+    const u8 = new Uint8Array(buf), dv = new DataView(buf);
+    const kids = (b, t) => mp4Boxes(u8, dv, b.body, b.end).filter(x => x.type === t);
+    const kid = (b, t) => (b && kids(b, t)[0]) || null;
+    const top = mp4Boxes(u8, dv, 0, u8.length);
+    const ftyp = top.find(b => b.type === 'ftyp'), moov = top.find(b => b.type === 'moov');
+    const moofs = top.filter(b => b.type === 'moof');
+    if (!ftyp || !moov || !moofs.length) throw new Error('not a fragmented mp4');
+    const v1 = b => u8[b.body] === 1;
+    const tracks = {};
+    for (const trak of kids(moov, 'trak')) {
+      const tkhd = kid(trak, 'tkhd'), mdia = kid(trak, 'mdia');
+      const mdhd = kid(mdia, 'mdhd'), hdlr = kid(mdia, 'hdlr');
+      const stsd = kid(kid(kid(mdia, 'minf'), 'stbl'), 'stsd');
+      const id = dv.getUint32(tkhd.body + (v1(tkhd) ? 20 : 12));
+      tracks[id] = {
+        timescale: dv.getUint32(mdhd.body + (v1(mdhd) ? 20 : 12)),
+        handler: String.fromCharCode(...u8.subarray(hdlr.body + 8, hdlr.body + 12)),
+        stsd: stsd ? u8.slice(stsd.start, stsd.end) : new Uint8Array(0),
+        defDur: 0, tkhd, mdhd, elst: kid(kid(trak, 'edts'), 'elst')
+      };
+    }
+    const mvex = kid(moov, 'mvex');
+    if (mvex) for (const trex of kids(mvex, 'trex')) {
+      const id = dv.getUint32(trex.body + 4);
+      if (tracks[id]) tracks[id].defDur = dv.getUint32(trex.body + 12);
+    }
+    const frags = moofs.map(moof => ({
+      mfhdPos: kid(moof, 'mfhd').body + 4,
+      trafs: kids(moof, 'traf').map(traf => {
+        const tfhd = kid(traf, 'tfhd'), tfdt = kid(traf, 'tfdt');
+        if (!tfdt) throw new Error('no tfdt');
+        const fl = dv.getUint32(tfhd.body) & 0xffffff;
+        if (fl & 0x1) throw new Error('absolute data offsets');
+        const id = dv.getUint32(tfhd.body + 4);
+        let q = tfhd.body + 8; if (fl & 0x2) q += 4;
+        const defDur = (fl & 0x8) ? dv.getUint32(q) : (tracks[id] ? tracks[id].defDur : 0);
+        const big = v1(tfdt);
+        const base = big ? Number(dv.getBigUint64(tfdt.body + 4)) : dv.getUint32(tfdt.body + 4);
+        let dur = 0;
+        for (const trun of kids(traf, 'trun')) {
+          const tf = dv.getUint32(trun.body) & 0xffffff;
+          const n = dv.getUint32(trun.body + 4);
+          let r = trun.body + 8; if (tf & 0x1) r += 4; if (tf & 0x4) r += 4;
+          const per = [0x100, 0x200, 0x400, 0x800].reduce((a, f) => a + ((tf & f) ? 4 : 0), 0);
+          if (tf & 0x100) for (let i = 0; i < n; i++) dur += dv.getUint32(r + i * per);
+          else dur += n * defDur;
+        }
+        return { id, pos: tfdt.body + 4, big, base, dur };
+      })
+    }));
+    const span = {};
+    for (const f of frags) for (const t of f.trafs) {
+      const sp = span[t.id] || (span[t.id] = { start: Infinity, end: 0 });
+      sp.start = Math.min(sp.start, t.base); sp.end = Math.max(sp.end, t.base + t.dur);
+    }
+    const mvhd = kid(moov, 'mvhd');
+    return { u8, dv, top, ftyp, moov, tracks, frags, span, mvhd, mehd: kid(mvex, 'mehd'),
+             movieTs: dv.getUint32(mvhd.body + (v1(mvhd) ? 20 : 12)) };
+  }
+
+  function sameBytes(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  // write a duration field (32 or 64 bit by box version), only where the box had one
+  function setDur(f, box, off0, off1, value, force) {
+    if (!box) return;
+    const big = f.u8[box.body] === 1;
+    const pos = box.body + (big ? off1 : off0);
+    const cur = big ? Number(f.dv.getBigUint64(pos)) : f.dv.getUint32(pos);
+    if (!cur && !force) return;
+    if (big) f.dv.setBigUint64(pos, BigInt(value)); else f.dv.setUint32(pos, Math.min(value, 0xffffffff));
+  }
+
+  async function mergeClips(blobs) {
+    const files = [];
+    for (const b of blobs) files.push(parseMp4(await b.arrayBuffer()));
+    const A = files[0];
+    const ids = Object.keys(A.tracks);
+    for (const f of files) {
+      if (Object.keys(f.tracks).length !== ids.length) throw new Error('track count differs');
+      for (const id of ids) {
+        const a = A.tracks[id], b = f.tracks[id];
+        if (!b || a.timescale !== b.timescale || a.handler !== b.handler || !sameBytes(a.stsd, b.stsd)) throw new Error('clips use different formats');
+      }
+    }
+    let seq = 1, cum = 0;
+    const parts = [];
+    for (const f of files) {
+      let sec = 0;
+      for (const id of ids) { const sp = f.span[id]; if (sp) sec = Math.max(sec, (sp.end - sp.start) / f.tracks[id].timescale); }
+      for (const fr of f.frags) {
+        f.dv.setUint32(fr.mfhdPos, seq++);
+        for (const t of fr.trafs) {
+          const v = t.base - f.span[t.id].start + Math.round(cum * f.tracks[t.id].timescale);
+          if (t.big) f.dv.setBigUint64(t.pos, BigInt(v));
+          else { if (v > 0xffffffff) throw new Error('timestamp overflow'); f.dv.setUint32(t.pos, v); }
+        }
+      }
+      for (const b of f.top) if (b.type === 'moof' || b.type === 'mdat') parts.push(f.u8.subarray(b.start, b.end));
+      cum += sec;
+    }
+    // stretch any duration fields in the header to the joined length
+    const mv = Math.round(cum * A.movieTs);
+    setDur(A, A.mvhd, 16, 24, mv);
+    setDur(A, A.mehd, 4, 4, mv, true);
+    for (const id of ids) {
+      const t = A.tracks[id];
+      setDur(A, t.tkhd, 20, 28, mv);
+      setDur(A, t.mdhd, 16, 24, Math.round(cum * t.timescale));
+      setDur(A, t.elst, 8, 8, mv);
+    }
+    return {
+      blob: new Blob([A.u8.subarray(A.ftyp.start, A.ftyp.end), A.u8.subarray(A.moov.start, A.moov.end), ...parts], { type: 'video/mp4' }),
+      seconds: cum
+    };
   }
 
   $('camOpen').addEventListener('click', camOpen);
-  $('camClose').addEventListener('click', camStop);
+  $('camClose').addEventListener('click', () => {
+    if (S.shoot === 'multi' && cam.clips.length && !isRecording()) camDeleteLast(); else camStop();
+  });
+  $('camPills').addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (isRecording() || cam.clips.length) return; // locked once a take exists
+    const key = b.parentElement.dataset.key;
+    S[key] = b.dataset.v; store.set(key, S[key]);
+    camUI();
+  });
   $('camExit').addEventListener('click', camStop);
   $('camRec').addEventListener('click', camToggleRec);
   $('camFitBtn').addEventListener('click', () => {
@@ -872,21 +1136,25 @@
     camApplyFormat();
   });
   $('camPrompt').addEventListener('click', () => { cam.scrolling = !cam.scrolling; cam.lastTs = null; });
-  $('camRestart').addEventListener('click', () => { cam.t = cam.L.lead; cam.lastTs = null; });
+  $('camRestart').addEventListener('click', () => {
+    if (S.shoot === 'multi' && cam.clips.length && !isRecording()) { camFinish(); return; }
+    cam.t = cam.L.lead; cam.lastTs = null;
+  });
   $('camSlower').addEventListener('click', () => { cam.rate = Math.max(0.5, Math.round((cam.rate - 0.1) * 10) / 10); camRateUI(); });
   $('camFaster').addEventListener('click', () => { cam.rate = Math.min(2, Math.round((cam.rate + 0.1) * 10) / 10); camRateUI(); });
   $('camRetake').addEventListener('click', () => {
     $('review').pause();
     $('camDone').classList.add('hidden');
+    cam.clips = []; cam.parts = null;
     cam.t = cam.L.lead; cam.scrolling = false; cam.lastTs = null;
-    $('camTime').textContent = '按紅色鍵開始錄影';
+    camUI();
   });
   $('camSave').addEventListener('click', async () => {
     if (!cam.blob) return;
-    const file = new File([cam.blob], $('camDl').download, { type: cam.blob.type });
+    const files = cam.parts || [new File([cam.blob], $('camDl').download, { type: cam.blob.type })];
     try {
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file] }); // iOS share sheet → 儲存影片
+      if (navigator.canShare && navigator.canShare({ files })) {
+        await navigator.share({ files }); // iOS share sheet → 儲存影片
         return;
       }
     } catch (e) {
