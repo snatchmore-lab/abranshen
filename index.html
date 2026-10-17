@@ -256,6 +256,7 @@
       <video id="camVideo" playsinline muted autoplay></video>
       <div class="camGrid"></div>
     </div>
+    <button class="camFitBtn" id="camModeBtn" style="right:auto;left:10px"></button>
     <button class="camFitBtn" id="camFitBtn"></button>
   </div>
   <div class="camErr hidden" id="camErr"></div>
@@ -628,6 +629,9 @@
 
   // 'fill' = crop to fill 9:16; 'full' = whole camera image, black bars if needed
   let camFitMode = store.get('fit', 'full');
+  // 'raw' = record the camera stream itself (best quality, smooth);
+  // 'fix' = redraw onto a portrait canvas (for phones whose raw recording comes out sideways)
+  let camRecMode = store.get('recMode', 'raw');
 
   function sizeRecCanvas() {
     const v = $('camVideo');
@@ -660,15 +664,30 @@
   }
 
   function camFitUI() {
-    $('camVideo').style.objectFit = camFitMode === 'fill' ? 'cover' : 'contain';
+    const raw = camRecMode === 'raw';
+    $('camVideo').style.objectFit = raw || camFitMode !== 'fill' ? 'contain' : 'cover';
     $('camFitBtn').textContent = camFitMode === 'fill' ? '顯示完整鏡頭畫面' : '填滿直式畫面';
+    $('camFitBtn').classList.toggle('hidden', raw);
+    $('camModeBtn').textContent = raw ? '模式：原始畫質' : '模式：直式修正';
+  }
+
+  // draw one canvas frame per real camera frame, and push it to the recording
+  function pumpRecFrames() {
+    const v = $('camVideo');
+    const tick = () => {
+      if (!cam.recorder || cam.recorder.state !== 'recording' || camRecMode !== 'fix') return;
+      drawRecFrame();
+      if (cam.canvasTrack && cam.canvasTrack.requestFrame) cam.canvasTrack.requestFrame();
+      schedule();
+    };
+    const schedule = () => v.requestVideoFrameCallback ? v.requestVideoFrameCallback(tick) : requestAnimationFrame(tick);
+    schedule();
   }
 
   function camLoop(ts) {
     if (cam.scrolling && cam.lastTs !== null) cam.t = Math.min(cam.L.total, cam.t + (ts - cam.lastTs) / 1000 * cam.rate);
     cam.lastTs = ts;
     draw(cam.L, cam.t);
-    if (cam.recorder && cam.recorder.state === 'recording') drawRecFrame();
     if (cam.recorder && cam.recorder.state === 'recording') {
       const s = Math.floor((performance.now() - cam.recStart) / 1000);
       $('camTime').innerHTML = '<span class="dot"></span>' + String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
@@ -681,15 +700,18 @@
   // Size the frame to the camera's real aspect ratio so the preview = the recording
   function camFit() {
     const v = $('camVideo'), st = $('camStage'), fr = $('camFrame');
-    // frame is always 9:16; the video fills it with object-fit: cover = same crop as the recording
-    const vw = 9, vh = 16;
+    // raw: frame = the camera's own shape; fix: always 9:16, same crop as the canvas recording
+    const raw = camRecMode === 'raw';
+    const vw = raw ? (v.videoWidth || 9) : 9, vh = raw ? (v.videoHeight || 16) : 16;
     const sw = st.clientWidth, sh = st.clientHeight;
     if (!sw || !sh) return;
     const k = Math.min(sw / vw, sh / vh);
     const w = Math.round(vw * k), h = Math.round(vh * k);
     Object.assign(fr.style, { width: w + 'px', height: h + 'px', left: Math.round((sw - w) / 2) + 'px', top: Math.round((sh - h) / 2) + 'px' });
     sizeRecCanvas();
-    $('camRes').textContent = recCanvas.width && v.videoWidth ? '（直式 ' + recCanvas.width + '×' + recCanvas.height + '，鏡頭 ' + v.videoWidth + '×' + v.videoHeight + '）' : '';
+    $('camRes').textContent = !v.videoWidth ? '' : raw
+      ? '（鏡頭 ' + v.videoWidth + '×' + v.videoHeight + '）'
+      : '（直式 ' + recCanvas.width + '×' + recCanvas.height + '，鏡頭 ' + v.videoWidth + '×' + v.videoHeight + '）';
   }
   $('camVideo').addEventListener('loadedmetadata', camFit);
   $('camVideo').addEventListener('resize', camFit);
@@ -748,10 +770,21 @@
       return;
     }
     const type = ['video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm'].find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
-    sizeRecCanvas();
-    drawRecFrame();
-    const out = recCanvas.captureStream(30);
-    cam.stream.getAudioTracks().forEach(t => out.addTrack(t));
+    let out = cam.stream;
+    cam.canvasTrack = null;
+    if (camRecMode === 'fix') {
+      sizeRecCanvas();
+      drawRecFrame();
+      const probe = recCanvas.captureStream(0).getVideoTracks()[0];
+      if (probe && probe.requestFrame) {
+        out = new MediaStream([probe]);
+        cam.canvasTrack = probe;
+      } else {
+        if (probe) probe.stop();
+        out = recCanvas.captureStream(30);
+      }
+      cam.stream.getAudioTracks().forEach(t => out.addTrack(t));
+    }
     try {
       cam.recorder = new MediaRecorder(out, Object.assign({ videoBitsPerSecond: 8_000_000 }, type ? { mimeType: type } : {}));
     } catch (e) {
@@ -765,6 +798,7 @@
       $('camRec').classList.remove('on');
       cam.scrolling = false;
       cam.blob = new Blob(cam.chunks, { type: cam.recorder.mimeType || type || 'video/mp4' });
+      if (cam.canvasTrack) { cam.canvasTrack.stop(); cam.canvasTrack = null; }
       if (cam.url) URL.revokeObjectURL(cam.url);
       cam.url = URL.createObjectURL(cam.blob);
       const ext = cam.blob.type.includes('webm') ? 'webm' : 'mp4';
@@ -775,6 +809,7 @@
     };
     cam.recorder.start(1000);
     cam.recStart = performance.now();
+    pumpRecFrames();
     $('camRec').classList.add('on');
     // restart the script with its countdown
     cam.t = 0; cam.lastTs = null; cam.scrolling = true;
@@ -788,6 +823,12 @@
     if (cam.recorder && cam.recorder.state === 'recording') return;
     camFitMode = camFitMode === 'fill' ? 'full' : 'fill';
     store.set('fit', camFitMode);
+    camFitUI(); camFit();
+  });
+  $('camModeBtn').addEventListener('click', () => {
+    if (cam.recorder && cam.recorder.state === 'recording') return;
+    camRecMode = camRecMode === 'raw' ? 'fix' : 'raw';
+    store.set('recMode', camRecMode);
     camFitUI(); camFit();
   });
   $('camPrompt').addEventListener('click', () => { cam.scrolling = !cam.scrolling; cam.lastTs = null; });
