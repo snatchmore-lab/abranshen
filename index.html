@@ -710,12 +710,36 @@
     Object.assign(fr.style, { width: w + 'px', height: h + 'px', left: Math.round((sw - w) / 2) + 'px', top: Math.round((sh - h) / 2) + 'px' });
     sizeRecCanvas();
     $('camRes').textContent = !v.videoWidth ? '' : raw
-      ? '（鏡頭 ' + v.videoWidth + '×' + v.videoHeight + '）'
+      ? '（鏡頭 ' + v.videoWidth + '×' + v.videoHeight + (isPortrait169(v.videoWidth, v.videoHeight) ? '，9:16' : '，非 9:16') + '）'
       : '（直式 ' + recCanvas.width + '×' + recCanvas.height + '，鏡頭 ' + v.videoWidth + '×' + v.videoHeight + '）';
   }
   $('camVideo').addEventListener('loadedmetadata', camFit);
   $('camVideo').addEventListener('resize', camFit);
   window.addEventListener('resize', () => { if (!$('cam').classList.contains('hidden')) camFit(); });
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const isPortrait169 = (w, h) => h > w && Math.abs(h / w - 16 / 9) < 0.06;
+
+  // Original-quality mode records the camera stream as-is, so ask the camera itself
+  // for 9:16 (same as the built-in Camera's video mode). iOS may read width/height
+  // in sensor (landscape) terms, so try both ways and keep whichever comes out 9:16.
+  async function camApplyFormat() {
+    const track = cam.stream && cam.stream.getVideoTracks()[0];
+    const v = $('camVideo');
+    if (!track) return;
+    const tries = camRecMode === 'raw'
+      ? [{ width: { ideal: 1920 }, height: { ideal: 1080 } },
+         { width: { ideal: 1080 }, height: { ideal: 1920 } },
+         { aspectRatio: { exact: 9 / 16 }, height: { ideal: 1920 } },
+         { aspectRatio: { exact: 16 / 9 }, width: { ideal: 1920 } }]
+      : [{ width: { ideal: 1920 }, height: { ideal: 1920 } }]; // widest 4:3, cropped later
+    for (const c of tries) {
+      try { await track.applyConstraints(Object.assign({ frameRate: { ideal: 30 } }, c)); } catch (e) { continue; }
+      await sleep(500);
+      if (camRecMode !== 'raw' || isPortrait169(v.videoWidth, v.videoHeight)) break;
+    }
+    camFit();
+  }
 
   async function camOpen() {
     if (!charCount(S.script)) { $('status').textContent = '請先貼上腳本。'; return; }
@@ -746,6 +770,7 @@
       }
       $('camVideo').srcObject = cam.stream;
       await $('camVideo').play().catch(() => {});
+      await camApplyFormat();
     } catch (e) {
       console.error(e);
       $('camErr').textContent = '無法開啟相機：' + (e.message || e) + '。請在 Safari 允許使用相機與麥克風（設定 → Safari → 相機／麥克風）。';
@@ -830,6 +855,7 @@
     camRecMode = camRecMode === 'raw' ? 'fix' : 'raw';
     store.set('recMode', camRecMode);
     camFitUI(); camFit();
+    camApplyFormat();
   });
   $('camPrompt').addEventListener('click', () => { cam.scrolling = !cam.scrolling; cam.lastTs = null; });
   $('camRestart').addEventListener('click', () => { cam.t = cam.L.lead; cam.lastTs = null; });
