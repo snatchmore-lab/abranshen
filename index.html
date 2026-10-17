@@ -103,6 +103,34 @@
   .tips { font-size: 14px; color: var(--muted); padding-left: 20px; margin: 8px 0 0; }
   .tips li { margin: 4px 0; }
   details summary { cursor: pointer; font-weight: 600; }
+
+  /* in-page camera mode */
+  .cam { position: fixed; inset: 0; background: #000; z-index: 10; overflow: hidden; }
+  #camVideo { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  #camPrompt { position: absolute; left: 0; right: 0; top: env(safe-area-inset-top); width: 100%; opacity: .9; }
+  .camInfo {
+    position: absolute; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom) + 112px);
+    text-align: center; color: #fff; font-size: 14px; text-shadow: 0 1px 3px rgba(0,0,0,.8);
+    font-variant-numeric: tabular-nums;
+  }
+  .camInfo .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #ff3b30; margin-right: 6px; vertical-align: 1px; }
+  .camBar {
+    position: absolute; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom) + 24px);
+    display: flex; align-items: center; justify-content: space-evenly;
+  }
+  .camBar button {
+    width: 54px; height: 54px; border-radius: 50%; border: 0;
+    background: rgba(0,0,0,.55); color: #fff; font: inherit; font-size: 15px; cursor: pointer;
+  }
+  .camBar .rec { width: 78px; height: 78px; border: 5px solid #fff; background: #ff3b30; display: grid; place-items: center; }
+  .camBar .rec.on { background: rgba(0,0,0,.45); }
+  .camBar .rec.on::after { content: ""; width: 28px; height: 28px; border-radius: 6px; background: #ff3b30; }
+  .camDone {
+    position: absolute; inset: 0; background: var(--bg); color: var(--text); overflow: auto;
+    padding: calc(env(safe-area-inset-top) + 20px) 16px calc(env(safe-area-inset-bottom) + 30px);
+  }
+  .camDone video { width: 100%; max-height: 62vh; background: #000; border-radius: 12px; display: block; margin-bottom: 14px; }
+  .camErr { position: absolute; left: 16px; right: 16px; top: 40%; color: #fff; text-align: center; }
 </style>
 </head>
 <body>
@@ -192,12 +220,40 @@
   </section>
 
   <section class="card">
+    <h2 class="step"><span class="num">B</span>在網頁裡直接錄影（推薦）</h2>
+    <p class="tips" style="padding:0;margin:0 0 12px">浮動視窗一開相機就暫停的話，用這個：前鏡頭畫面和提詞文字在同一頁，<b>只錄鏡頭畫面和聲音</b>，文字不會被錄進去。錄完可直接存到相簿。</p>
+    <button class="big" id="camOpen">開啟前鏡頭錄影</button>
+  </section>
+
+  <section class="card">
     <details>
       <summary>為什麼不會錄到提詞文字？</summary>
       <p class="tips" style="padding:0">畫中畫視窗是蓋在螢幕上的系統層，相機錄的是鏡頭畫面，不是螢幕，所以文字不會出現在影片裡，也不用後製剪掉。</p>
     </details>
   </section>
 </main>
+
+<div class="cam hidden" id="cam">
+  <video id="camVideo" playsinline muted autoplay></video>
+  <canvas id="camPrompt"></canvas>
+  <div class="camErr hidden" id="camErr"></div>
+  <div class="camInfo"><span id="camTime">按紅色鍵開始錄影</span> · 速度 <span id="camRate">1.0×</span><br>點文字可暫停／繼續捲動</div>
+  <div class="camBar">
+    <button id="camClose" aria-label="關閉">✕</button>
+    <button id="camSlower" aria-label="變慢">慢</button>
+    <button id="camRec" class="rec" aria-label="錄影"></button>
+    <button id="camFaster" aria-label="變快">快</button>
+    <button id="camRestart" aria-label="文字回到開頭">↺</button>
+  </div>
+  <div class="camDone hidden" id="camDone">
+    <h2 class="step"><span class="num">✓</span>錄好了</h2>
+    <video id="review" playsinline controls></video>
+    <button class="big" id="camSave">儲存到相簿</button>
+    <a class="ghost" id="camDl">下載影片</a>
+    <button class="ghost" id="camRetake">重錄</button>
+    <button class="ghost" id="camExit">回到設定</button>
+  </div>
+</div>
 
 <script>
 (() => {
@@ -529,6 +585,127 @@
       console.error(e);
       $('status').textContent = '無法開啟浮動視窗：' + (e.message || e) + '（可先按一下影片播放再試）';
     }
+  });
+
+  // ---------- In-page camera recording ----------
+  const cam = {
+    stream: null, recorder: null, chunks: [], blob: null, url: null,
+    L: null, raf: 0, t: 0, lastTs: null, scrolling: false, rate: 1, recStart: 0
+  };
+
+  function camLoop(ts) {
+    if (cam.scrolling && cam.lastTs !== null) cam.t = Math.min(cam.L.total, cam.t + (ts - cam.lastTs) / 1000 * cam.rate);
+    cam.lastTs = ts;
+    draw(cam.L, cam.t);
+    if (cam.recorder && cam.recorder.state === 'recording') {
+      const s = Math.floor((performance.now() - cam.recStart) / 1000);
+      $('camTime').innerHTML = '<span class="dot"></span>' + String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+    }
+    cam.raf = requestAnimationFrame(camLoop);
+  }
+
+  function camRateUI() { $('camRate').textContent = cam.rate.toFixed(1) + '×'; }
+
+  async function camOpen() {
+    if (!charCount(S.script)) { $('status').textContent = '請先貼上腳本。'; return; }
+    $('cam').classList.remove('hidden');
+    $('camDone').classList.add('hidden');
+    $('camErr').classList.add('hidden');
+    document.body.style.overflow = 'hidden';
+    cam.L = makeLayout($('camPrompt'));
+    cam.t = cam.L.lead; // show the text still, ready to go
+    cam.scrolling = false; cam.lastTs = null; cam.rate = Number(S.rate) || 1;
+    camRateUI();
+    $('camTime').textContent = '按紅色鍵開始錄影';
+    cancelAnimationFrame(cam.raf);
+    cam.raf = requestAnimationFrame(camLoop);
+    if (cam.stream) return;
+    try {
+      cam.stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 1080 }, height: { ideal: 1920 }, frameRate: { ideal: 30 } },
+        audio: { echoCancellation: true, noiseSuppression: true }
+      });
+      $('camVideo').srcObject = cam.stream;
+      await $('camVideo').play().catch(() => {});
+    } catch (e) {
+      console.error(e);
+      $('camErr').textContent = '無法開啟相機：' + (e.message || e) + '。請在 Safari 允許使用相機與麥克風（設定 → Safari → 相機／麥克風）。';
+      $('camErr').classList.remove('hidden');
+    }
+  }
+
+  function camStop() {
+    if (cam.recorder && cam.recorder.state !== 'inactive') cam.recorder.stop();
+    if (cam.stream) cam.stream.getTracks().forEach(t => t.stop());
+    cam.stream = null;
+    $('camVideo').srcObject = null;
+    cancelAnimationFrame(cam.raf);
+    $('cam').classList.add('hidden');
+    document.body.style.overflow = '';
+  }
+
+  function camToggleRec() {
+    if (!cam.stream) return;
+    if (cam.recorder && cam.recorder.state === 'recording') {
+      cam.recorder.stop();
+      return;
+    }
+    const type = ['video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm'].find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+    try {
+      cam.recorder = new MediaRecorder(cam.stream, Object.assign({ videoBitsPerSecond: 8_000_000 }, type ? { mimeType: type } : {}));
+    } catch (e) {
+      $('camErr').textContent = '這個瀏覽器不支援網頁錄影，請用 iPhone 的 Safari。';
+      $('camErr').classList.remove('hidden');
+      return;
+    }
+    cam.chunks = [];
+    cam.recorder.ondataavailable = e => { if (e.data && e.data.size) cam.chunks.push(e.data); };
+    cam.recorder.onstop = () => {
+      $('camRec').classList.remove('on');
+      cam.scrolling = false;
+      cam.blob = new Blob(cam.chunks, { type: cam.recorder.mimeType || type || 'video/mp4' });
+      if (cam.url) URL.revokeObjectURL(cam.url);
+      cam.url = URL.createObjectURL(cam.blob);
+      const ext = cam.blob.type.includes('webm') ? 'webm' : 'mp4';
+      $('review').src = cam.url;
+      $('camDl').href = cam.url;
+      $('camDl').download = 'reels-' + new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '') + '.' + ext;
+      $('camDone').classList.remove('hidden');
+    };
+    cam.recorder.start(1000);
+    cam.recStart = performance.now();
+    $('camRec').classList.add('on');
+    // restart the script with its countdown
+    cam.t = 0; cam.lastTs = null; cam.scrolling = true;
+  }
+
+  $('camOpen').addEventListener('click', camOpen);
+  $('camClose').addEventListener('click', camStop);
+  $('camExit').addEventListener('click', camStop);
+  $('camRec').addEventListener('click', camToggleRec);
+  $('camPrompt').addEventListener('click', () => { cam.scrolling = !cam.scrolling; cam.lastTs = null; });
+  $('camRestart').addEventListener('click', () => { cam.t = cam.L.lead; cam.lastTs = null; });
+  $('camSlower').addEventListener('click', () => { cam.rate = Math.max(0.5, Math.round((cam.rate - 0.1) * 10) / 10); camRateUI(); });
+  $('camFaster').addEventListener('click', () => { cam.rate = Math.min(2, Math.round((cam.rate + 0.1) * 10) / 10); camRateUI(); });
+  $('camRetake').addEventListener('click', () => {
+    $('review').pause();
+    $('camDone').classList.add('hidden');
+    cam.t = cam.L.lead; cam.scrolling = false; cam.lastTs = null;
+    $('camTime').textContent = '按紅色鍵開始錄影';
+  });
+  $('camSave').addEventListener('click', async () => {
+    if (!cam.blob) return;
+    const file = new File([cam.blob], $('camDl').download, { type: cam.blob.type });
+    try {
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file] }); // iOS share sheet → 儲存影片
+        return;
+      }
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      console.warn(e);
+    }
+    $('camDl').click();
   });
 
   refresh();
