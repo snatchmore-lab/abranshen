@@ -105,19 +105,30 @@
   details summary { cursor: pointer; font-weight: 600; }
 
   /* in-page camera mode */
-  .cam { position: fixed; inset: 0; background: #000; z-index: 10; overflow: hidden; }
-  #camVideo { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
-  #camPrompt { position: absolute; left: 0; right: 0; top: env(safe-area-inset-top); width: 100%; opacity: .9; }
+  .cam {
+    position: fixed; inset: 0; background: #000; z-index: 10; overflow: hidden;
+    display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top) 0 calc(env(safe-area-inset-bottom) + 12px);
+  }
+  #camPrompt { flex: none; width: 100%; display: block; }
+  /* stage shows exactly what gets recorded: no cropping */
+  .camStage { flex: 1; min-height: 0; position: relative; }
+  .camFrame { position: absolute; overflow: hidden; outline: 1px solid rgba(255,255,255,.35); }
+  #camVideo { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); display: block; }
+  .camGrid {
+    position: absolute; inset: 0; pointer-events: none;
+    background:
+      linear-gradient(to right, transparent calc(33.33% - .5px), rgba(255,255,255,.3) 33.33%, transparent calc(33.33% + .5px), transparent calc(66.66% - .5px), rgba(255,255,255,.3) 66.66%, transparent calc(66.66% + .5px)),
+      linear-gradient(to bottom, transparent calc(33.33% - .5px), rgba(255,255,255,.3) 33.33%, transparent calc(33.33% + .5px), transparent calc(66.66% - .5px), rgba(255,255,255,.3) 66.66%, transparent calc(66.66% + .5px));
+  }
   .camInfo {
-    position: absolute; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom) + 112px);
-    text-align: center; color: #fff; font-size: 14px; text-shadow: 0 1px 3px rgba(0,0,0,.8);
+    flex: none; padding: 8px 12px 6px;
+    text-align: center; color: #fff; font-size: 13px; line-height: 1.5;
     font-variant-numeric: tabular-nums;
   }
+  .camInfo small { color: rgba(255,255,255,.6); }
   .camInfo .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #ff3b30; margin-right: 6px; vertical-align: 1px; }
-  .camBar {
-    position: absolute; left: 0; right: 0; bottom: calc(env(safe-area-inset-bottom) + 24px);
-    display: flex; align-items: center; justify-content: space-evenly;
-  }
+  .camBar { flex: none; display: flex; align-items: center; justify-content: space-evenly; }
   .camBar button {
     width: 54px; height: 54px; border-radius: 50%; border: 0;
     background: rgba(0,0,0,.55); color: #fff; font: inherit; font-size: 15px; cursor: pointer;
@@ -234,10 +245,15 @@
 </main>
 
 <div class="cam hidden" id="cam">
-  <video id="camVideo" playsinline muted autoplay></video>
   <canvas id="camPrompt"></canvas>
+  <div class="camStage" id="camStage">
+    <div class="camFrame" id="camFrame">
+      <video id="camVideo" playsinline muted autoplay></video>
+      <div class="camGrid"></div>
+    </div>
+  </div>
   <div class="camErr hidden" id="camErr"></div>
-  <div class="camInfo"><span id="camTime">按紅色鍵開始錄影</span> · 速度 <span id="camRate">1.0×</span><br>點文字可暫停／繼續捲動</div>
+  <div class="camInfo"><span id="camTime">按紅色鍵開始錄影</span> · 速度 <span id="camRate">1.0×</span><br><small>框線內就是錄到的完整畫面<span id="camRes"></span> · 點文字可暫停</small></div>
   <div class="camBar">
     <button id="camClose" aria-label="關閉">✕</button>
     <button id="camSlower" aria-label="變慢">慢</button>
@@ -606,6 +622,21 @@
 
   function camRateUI() { $('camRate').textContent = cam.rate.toFixed(1) + '×'; }
 
+  // Size the frame to the camera's real aspect ratio so the preview = the recording
+  function camFit() {
+    const v = $('camVideo'), st = $('camStage'), fr = $('camFrame');
+    const vw = v.videoWidth || 9, vh = v.videoHeight || 16;
+    const sw = st.clientWidth, sh = st.clientHeight;
+    if (!sw || !sh) return;
+    const k = Math.min(sw / vw, sh / vh);
+    const w = Math.round(vw * k), h = Math.round(vh * k);
+    Object.assign(fr.style, { width: w + 'px', height: h + 'px', left: Math.round((sw - w) / 2) + 'px', top: Math.round((sh - h) / 2) + 'px' });
+    $('camRes').textContent = v.videoWidth ? '（' + v.videoWidth + '×' + v.videoHeight + '）' : '';
+  }
+  $('camVideo').addEventListener('loadedmetadata', camFit);
+  $('camVideo').addEventListener('resize', camFit);
+  window.addEventListener('resize', () => { if (!$('cam').classList.contains('hidden')) camFit(); });
+
   async function camOpen() {
     if (!charCount(S.script)) { $('status').textContent = '請先貼上腳本。'; return; }
     $('cam').classList.remove('hidden');
@@ -619,10 +650,11 @@
     $('camTime').textContent = '按紅色鍵開始錄影';
     cancelAnimationFrame(cam.raf);
     cam.raf = requestAnimationFrame(camLoop);
+    camFit();
     if (cam.stream) return;
     try {
       cam.stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: { ideal: 1080 }, height: { ideal: 1920 }, frameRate: { ideal: 30 } },
+        video: { facingMode: 'user', width: { ideal: 1080 }, height: { ideal: 1920 }, aspectRatio: { ideal: 9 / 16 }, frameRate: { ideal: 30 } },
         audio: { echoCancellation: true, noiseSuppression: true }
       });
       $('camVideo').srcObject = cam.stream;
